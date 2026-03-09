@@ -23,4 +23,4 @@ jobs:
         working-directory: importer
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python sync.py
+        run: python -u sync.py

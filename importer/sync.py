@@ -2,6 +2,9 @@ import hashlib
 import io
 import os
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 import pandas as pd
 import psycopg2
