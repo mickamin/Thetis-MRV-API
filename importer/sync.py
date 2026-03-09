@@ -272,9 +272,16 @@ def main():
 
         # Download the file
         url = DOWNLOAD_URL.format(year=year)
-        resp = requests.get(url, timeout=120)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+            "Referer": "https://mrv.emsa.europa.eu/",
+        }
+        resp = requests.get(url, headers=headers, timeout=120)
+        print(f"  Download status: {resp.status_code}, size: {len(resp.content)} bytes")
         if resp.status_code != 200:
-            print(f"  WARNING: got {resp.status_code} — skipping {year}")
+            print(f"  Response: {resp.text[:200]}")
+            print(f"  WARNING: skipping {year}")
             continue
 
         excel_bytes = resp.content
