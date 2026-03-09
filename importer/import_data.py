@@ -77,7 +77,7 @@ VR = "voluntary_reporting"
 # Import rows
 # ------------------------
 
-for _, row in df.head(50).iterrows():
+for _, row in df.iterrows():
 
     imo = int(row["ship__imo_number"])
     year = int(row["ship__reporting_period"])
