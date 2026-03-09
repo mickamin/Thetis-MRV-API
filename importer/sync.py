@@ -16,8 +16,9 @@ from dotenv import load_dotenv
 
 load_dotenv("../.env")
 
-DOWNLOAD_URL = "https://mrv.emsa.europa.eu/api/public-emission-report/download?year={year}"
-YEARS = range(2018, 2025)  # 2018 → 2024
+BASE_URL = "https://mrv.emsa.europa.eu"
+FILES_URL = f"{BASE_URL}/api/public-emission-report/downloadable-files"
+DOWNLOAD_URL = f"{BASE_URL}/api/public-emission-report/reporting-period-document/binary/{{year}}/{{version}}"
 
 AMR = "annual_monitoring_results"
 VR = "voluntary_reporting"
@@ -263,29 +264,25 @@ def import_row(cur, row):
 # Main sync loop
 # ------------------------------------------------------------------ #
 
-def make_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://mrv.emsa.europa.eu/",
-    })
-    # Hit the homepage first so the F5 load balancer sets its session cookie
-    session.get("https://mrv.emsa.europa.eu/", timeout=30)
-    print(f"Session cookies: {dict(session.cookies)}")
-    return session
+def fetch_available_files():
+    resp = requests.get(FILES_URL, timeout=30)
+    resp.raise_for_status()
+    return {r["reportingPeriod"]: r["version"] for r in resp.json()["results"]}
 
 
 def main():
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     cur = conn.cursor()
-    session = make_session()
 
-    for year in YEARS:
-        print(f"\n[{year}] Checking...")
+    available = fetch_available_files()
+    print(f"Available years: {available}")
+
+    for year, version in sorted(available.items()):
+        print(f"\n[{year}] Checking (version {version})...")
 
         # Download the file
-        url = DOWNLOAD_URL.format(year=year)
-        resp = session.get(url, timeout=120)
+        url = DOWNLOAD_URL.format(year=year, version=version)
+        resp = requests.get(url, timeout=120)
         print(f"  Download status: {resp.status_code}, size: {len(resp.content)} bytes")
         if resp.status_code != 200:
             print(f"  Response: {resp.text[:200]}")
