@@ -10,6 +10,7 @@ import pandas as pd
 import psycopg2
 import requests
 from dotenv import load_dotenv
+from psycopg2.extras import execute_values
 
 load_dotenv("../.env")
 
@@ -259,276 +260,140 @@ def delete_year(cur, year):
     print(f"  Deleted existing data for {year}")
 
 
-def import_row(cur, row):
-    imo = int(row["ship__imo_number"])
-    year = int(row["ship__reporting_period"])
-    is_new_format = "company__imo_number" in row.index
+def build_batches(df):
+    ship_rows, company_rows, doc_rows, verifier_rows = [], [], [], []
+    mm_rows, amr_rows, vr_rows = [], [], []
 
-    cur.execute(
-        """
-        insert into ship
-            (imo_number, reporting_period, name, ship_type,
-             technical_efficiency, port_of_registry, home_port, ice_class)
-        values (%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (imo, year,
-         row["ship__name"], row["ship__ship_type"],
-         row["ship__technical_efficiency"], row["ship__port_of_registry"],
-         row["ship__home_port"], row["ship__ice_class"]),
-    )
+    for _, row in df.iterrows():
+        imo = int(row["ship__imo_number"])
+        year = int(row["ship__reporting_period"])
+        is_new_format = "company__imo_number" in row.index
 
-    if is_new_format:
-        cur.execute(
-            """
-            insert into company (imo_number, reporting_period, company_imo_number, company_name)
-            values (%s,%s,%s,%s)
-            on conflict (imo_number, reporting_period) do nothing
-            """,
-            (imo, year,
-             get_col(row, "company__imo_number"),
-             get_col(row, "company__name")),
-        )
+        ship_rows.append((
+            imo, year,
+            row["ship__name"], row["ship__ship_type"],
+            row["ship__technical_efficiency"], row["ship__port_of_registry"],
+            row["ship__home_port"], row["ship__ice_class"],
+        ))
 
-    issue = pd.to_datetime(row["doc__doc_issue_date"], dayfirst=True, errors="coerce")
-    expiry = pd.to_datetime(row["doc__doc_expiry_date"], dayfirst=True, errors="coerce")
-    cur.execute(
-        """
-        insert into doc (imo_number, reporting_period, doc_issue_date, doc_expiry_date)
-        values (%s,%s,%s,%s)
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (imo, year,
-         issue.date() if pd.notna(issue) else None,
-         expiry.date() if pd.notna(expiry) else None),
-    )
+        if is_new_format:
+            company_rows.append((
+                imo, year,
+                get_col(row, "company__imo_number"),
+                get_col(row, "company__name"),
+            ))
 
-    cur.execute(
-        """
-        insert into verifier
-            (imo_number, reporting_period, verifier_number, verifier_name,
-             verifier_nab, verifier_address, verifier_city,
-             verifier_accreditation_number, verifier_country)
-        values (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (imo, year,
-         get_col(row, "verifier__verifier_number"),
-         row["verifier__verifier_name"],
-         row["verifier__verifier_nab"],
-         row["verifier__verifier_address"],
-         row["verifier__verifier_city"],
-         row["verifier__verifier_accreditation_number"],
-         row["verifier__verifier_country"]),
-    )
+        issue = pd.to_datetime(row["doc__doc_issue_date"], dayfirst=True, errors="coerce")
+        expiry = pd.to_datetime(row["doc__doc_expiry_date"], dayfirst=True, errors="coerce")
+        doc_rows.append((
+            imo, year,
+            issue.date() if pd.notna(issue) else None,
+            expiry.date() if pd.notna(expiry) else None,
+        ))
 
-    cur.execute(
-        """
-        insert into monitoring_methods (imo_number, reporting_period, a, b, c, d, d_1)
-        values (%s,%s,%s,%s,%s,%s,%s)
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (imo, year,
-         row["monitoring_methods__a"], row["monitoring_methods__b"],
-         row["monitoring_methods__c"], row["monitoring_methods__d"],
-         row["monitoring_methods__d_1"]),
-    )
+        verifier_rows.append((
+            imo, year,
+            get_col(row, "verifier__verifier_number"),
+            row["verifier__verifier_name"],
+            row["verifier__verifier_nab"],
+            row["verifier__verifier_address"],
+            row["verifier__verifier_city"],
+            row["verifier__verifier_accreditation_number"],
+            row["verifier__verifier_country"],
+        ))
 
-    total_fuel = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption__total_fuel_consumption_[m_tonnes]",
-        f"{AMR}__totals__total_fuel_consumption_[m_tonnes]",
-    ))
-    total_co2 = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions__total_co2_emissions_[m_tonnes]",
-        f"{AMR}__total_co2_emissions_[m_tonnes]",
-    ))
-    time_at_sea = clean_numeric(get_col(
-        row,
-        f"{AMR}__time_spent_at_sea_[hours]",
-        f"{AMR}__annual_time_spent_at_sea_[hours]",
-        f"{AMR}__annual_total_time_spent_at_sea_[hours]",
-    ))
-    fuel_per_dist = clean_numeric(get_col(
-        row,
-        f"{AMR}__average_energy_efficiency__fuel_consumption_per_distance_[kg_/_n_mile]",
-        f"{AMR}__average_energy_efficiency__annual_average_fuel_consumption_per_distance_[kg_/_n_mile]",
-    ))
-    fuel_per_mass = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption_per_transport_work_(mass)_[g_/_m_tonnes_·_n_miles]",
-        f"{AMR}__annual_average_fuel_consumption_per_transport_work_(mass)_[g_/_m_tonnes_·_n_miles]",
-    ))
-    fuel_per_vol = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption_per_transport_work_(volume)_[g_/_m³_·_n_miles]",
-        f"{AMR}__annual_average_fuel_consumption_per_transport_work_(volume)_[g_/_m³_·_n_miles]",
-    ))
-    fuel_per_dwt = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption_per_transport_work_(dwt)_[g_/_dwt_carried_·_n_miles]",
-        f"{AMR}__annual_average_fuel_consumption_per_transport_work_(dwt)_[g_/_dwt_carried_·_n_miles]",
-    ))
-    fuel_per_pax = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption_per_transport_work_(pax)_[g_/_pax_·_n_miles]",
-        f"{AMR}__annual_average_fuel_consumption_per_transport_work_(pax)_[g_/_pax_·_n_miles]",
-    ))
-    fuel_per_freight = clean_numeric(get_col(
-        row,
-        f"{AMR}__fuel_consumption_per_transport_work_(freight)_[g_/_m_tonnes_·_n_miles]",
-        f"{AMR}__annual_average_fuel_consumption_per_transport_work_(freight)_[g_/_m_tonnes_·_n_miles]",
-    ))
-    co2_per_dist = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_distance_[kg_co2_/_n_mile]",
-        f"{AMR}__annual_average_co2_emissions_per_distance_[kg_co2_/_n_mile]",
-    ))
-    co2_per_mass = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_transport_work_(mass)_[g_co2_/_m_tonnes_·_n_miles]",
-        f"{AMR}__annual_average_co2_emissions_per_transport_work_(mass)_[g_co2_/_m_tonnes_·_n_miles]",
-    ))
-    co2_per_vol = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_transport_work_(volume)_[g_co2_/_m³_·_n_miles]",
-        f"{AMR}__annual_average_co2_emissions_per_transport_work_(volume)_[g_co2_/_m³_·_n_miles]",
-    ))
-    co2_per_dwt = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_transport_work_(dwt)_[g_co2_/_dwt_carried_·_n_miles]",
-        f"{AMR}__annual_average_co2_emissions_per_transport_work_(dwt)_[g_co2_/_dwt_carried_·_n_miles]",
-    ))
-    co2_per_pax = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_transport_work_(pax)_[g_co2_/_pax_·_n_miles]",
-        f"{AMR}__annual_average_co2_emissions_per_transport_work_(pax)_[g_co2_/_pax_·_n_miles]",
-    ))
-    co2_per_freight = clean_numeric(get_col(
-        row,
-        f"{AMR}__co2_emissions_per_transport_work_(freight)_[g_co2_/_m_tonnes_·_n_miles]",
-        f"{AMR}__annual_average_co2_emissions_per_transport_work_(freight)_[g_co2_/_m_tonnes_·_n_miles]",
-    ))
+        mm_rows.append((
+            imo, year,
+            row["monitoring_methods__a"], row["monitoring_methods__b"],
+            row["monitoring_methods__c"], row["monitoring_methods__d"],
+            row["monitoring_methods__d_1"],
+        ))
 
-    additional_info = get_col(
-        row,
-        f"{AMR}__additional_voluntary_reporting__additional_information_to_facilitate_the_understanding_of_the_reported_average_operational_energy_efficiency_indicators",
-    ) or None
-    avg_cargo_density = clean_numeric(get_col(
-        row, f"{AMR}__average_density_of_the_cargo_transported_[m_tonnes_/_m³]",
-    ))
+        total_fuel = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption__total_fuel_consumption_[m_tonnes]",
+            f"{AMR}__totals__total_fuel_consumption_[m_tonnes]",
+        ))
+        total_co2 = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions__total_co2_emissions_[m_tonnes]",
+            f"{AMR}__total_co2_emissions_[m_tonnes]",
+        ))
+        time_at_sea = clean_numeric(get_col(
+            row,
+            f"{AMR}__time_spent_at_sea_[hours]",
+            f"{AMR}__annual_time_spent_at_sea_[hours]",
+            f"{AMR}__annual_total_time_spent_at_sea_[hours]",
+        ))
+        fuel_per_dist = clean_numeric(get_col(
+            row,
+            f"{AMR}__average_energy_efficiency__fuel_consumption_per_distance_[kg_/_n_mile]",
+            f"{AMR}__average_energy_efficiency__annual_average_fuel_consumption_per_distance_[kg_/_n_mile]",
+        ))
+        fuel_per_mass = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption_per_transport_work_(mass)_[g_/_m_tonnes_·_n_miles]",
+            f"{AMR}__annual_average_fuel_consumption_per_transport_work_(mass)_[g_/_m_tonnes_·_n_miles]",
+        ))
+        fuel_per_vol = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption_per_transport_work_(volume)_[g_/_m³_·_n_miles]",
+            f"{AMR}__annual_average_fuel_consumption_per_transport_work_(volume)_[g_/_m³_·_n_miles]",
+        ))
+        fuel_per_dwt = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption_per_transport_work_(dwt)_[g_/_dwt_carried_·_n_miles]",
+            f"{AMR}__annual_average_fuel_consumption_per_transport_work_(dwt)_[g_/_dwt_carried_·_n_miles]",
+        ))
+        fuel_per_pax = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption_per_transport_work_(pax)_[g_/_pax_·_n_miles]",
+            f"{AMR}__annual_average_fuel_consumption_per_transport_work_(pax)_[g_/_pax_·_n_miles]",
+        ))
+        fuel_per_freight = clean_numeric(get_col(
+            row,
+            f"{AMR}__fuel_consumption_per_transport_work_(freight)_[g_/_m_tonnes_·_n_miles]",
+            f"{AMR}__annual_average_fuel_consumption_per_transport_work_(freight)_[g_/_m_tonnes_·_n_miles]",
+        ))
+        co2_per_dist = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_distance_[kg_co2_/_n_mile]",
+            f"{AMR}__annual_average_co2_emissions_per_distance_[kg_co2_/_n_mile]",
+        ))
+        co2_per_mass = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_transport_work_(mass)_[g_co2_/_m_tonnes_·_n_miles]",
+            f"{AMR}__annual_average_co2_emissions_per_transport_work_(mass)_[g_co2_/_m_tonnes_·_n_miles]",
+        ))
+        co2_per_vol = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_transport_work_(volume)_[g_co2_/_m³_·_n_miles]",
+            f"{AMR}__annual_average_co2_emissions_per_transport_work_(volume)_[g_co2_/_m³_·_n_miles]",
+        ))
+        co2_per_dwt = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_transport_work_(dwt)_[g_co2_/_dwt_carried_·_n_miles]",
+            f"{AMR}__annual_average_co2_emissions_per_transport_work_(dwt)_[g_co2_/_dwt_carried_·_n_miles]",
+        ))
+        co2_per_pax = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_transport_work_(pax)_[g_co2_/_pax_·_n_miles]",
+            f"{AMR}__annual_average_co2_emissions_per_transport_work_(pax)_[g_co2_/_pax_·_n_miles]",
+        ))
+        co2_per_freight = clean_numeric(get_col(
+            row,
+            f"{AMR}__co2_emissions_per_transport_work_(freight)_[g_co2_/_m_tonnes_·_n_miles]",
+            f"{AMR}__annual_average_co2_emissions_per_transport_work_(freight)_[g_co2_/_m_tonnes_·_n_miles]",
+        ))
+        additional_info = get_col(
+            row,
+            f"{AMR}__additional_voluntary_reporting__additional_information_to_facilitate_the_understanding_of_the_reported_average_operational_energy_efficiency_indicators",
+        ) or None
+        avg_cargo_density = clean_numeric(get_col(
+            row, f"{AMR}__average_density_of_the_cargo_transported_[m_tonnes_/_m³]",
+        ))
 
-    cur.execute(
-        f"""
-        insert into annual_monitoring_results (
-            imo_number, reporting_period,
-            total_fuel_consumption_m_tonnes,
-            fuel_consumption_on_laden_m_tonnes,
-            fuel_consumption_derogation_m_tonnes,
-            fuel_consumption_cargo_heating_m_tonnes,
-            fuel_consumption_dynamic_positioning_m_tonnes,
-            total_co2_emissions_m_tonnes,
-            annual_total_time_spent_at_sea_hours,
-            co2_between_ms_ports_m_tonnes,
-            co2_from_ms_ports_m_tonnes,
-            co2_to_ms_ports_m_tonnes,
-            co2_at_berth_m_tonnes,
-            co2_at_ms_ports_m_tonnes,
-            co2_passenger_m_tonnes,
-            co2_freight_m_tonnes,
-            co2_on_laden_m_tonnes,
-            co2_ets_m_tonnes,
-            total_ch4_emissions_m_tonnes,
-            ch4_between_ms_ports_m_tonnes,
-            ch4_from_ms_ports_m_tonnes,
-            ch4_to_ms_ports_m_tonnes,
-            ch4_at_berth_m_tonnes,
-            ch4_at_ms_ports_m_tonnes,
-            ch4_on_laden_m_tonnes,
-            ch4_passenger_m_tonnes,
-            ch4_freight_m_tonnes,
-            ch4_ets_m_tonnes,
-            total_n2o_emissions_m_tonnes,
-            n2o_between_ms_ports_m_tonnes,
-            n2o_from_ms_ports_m_tonnes,
-            n2o_to_ms_ports_m_tonnes,
-            n2o_at_berth_m_tonnes,
-            n2o_at_ms_ports_m_tonnes,
-            n2o_on_laden_m_tonnes,
-            n2o_passenger_m_tonnes,
-            n2o_freight_m_tonnes,
-            n2o_ets_m_tonnes,
-            total_co2eq_emissions_m_tonnes,
-            co2eq_between_ms_ports_m_tonnes,
-            co2eq_from_ms_ports_m_tonnes,
-            co2eq_to_ms_ports_m_tonnes,
-            co2eq_at_berth_m_tonnes,
-            co2eq_at_ms_ports_m_tonnes,
-            co2eq_on_laden_m_tonnes,
-            co2eq_passenger_m_tonnes,
-            co2eq_freight_m_tonnes,
-            co2eq_ets_m_tonnes,
-            co2eq_derogation_m_tonnes,
-            distance_through_ice_n_miles,
-            time_spent_at_sea_through_ice_hours,
-            avg_fuel_per_distance_kg_n_mile,
-            avg_fuel_per_distance_on_laden_kg_n_mile,
-            avg_fuel_per_transport_mass_g,
-            avg_fuel_per_transport_mass_on_laden_g,
-            avg_fuel_per_transport_volume_g,
-            avg_fuel_per_transport_volume_on_laden_g,
-            avg_fuel_per_transport_dwt_g,
-            avg_fuel_per_transport_dwt_on_laden_g,
-            avg_fuel_per_transport_pax_g,
-            avg_fuel_per_transport_pax_on_laden_g,
-            avg_fuel_per_transport_freight_g,
-            avg_fuel_per_transport_freight_on_laden_g,
-            avg_fuel_per_time_at_sea_m_tonnes_hour,
-            avg_co2_per_distance_kg_n_mile,
-            avg_co2_per_distance_on_laden_kg_n_mile,
-            avg_co2_per_transport_mass_g,
-            avg_co2_per_transport_mass_on_laden_g,
-            avg_co2_per_transport_volume_g,
-            avg_co2_per_transport_volume_on_laden_g,
-            avg_co2_per_transport_dwt_g,
-            avg_co2_per_transport_dwt_on_laden_g,
-            avg_co2_per_transport_pax_g,
-            avg_co2_per_transport_pax_on_laden_g,
-            avg_co2_per_transport_freight_g,
-            avg_co2_per_transport_freight_on_laden_g,
-            avg_co2_per_time_at_sea_m_tonnes_hour,
-            avg_co2eq_per_distance_kg_n_mile,
-            avg_co2eq_per_distance_on_laden_kg_n_mile,
-            avg_co2eq_per_transport_mass_g,
-            avg_co2eq_per_transport_mass_on_laden_g,
-            avg_co2eq_per_transport_volume_g,
-            avg_co2eq_per_transport_volume_on_laden_g,
-            avg_co2eq_per_transport_dwt_g,
-            avg_co2eq_per_transport_dwt_on_laden_g,
-            avg_co2eq_per_transport_pax_g,
-            avg_co2eq_per_transport_pax_on_laden_g,
-            avg_co2eq_per_transport_freight_g,
-            avg_co2eq_per_transport_freight_on_laden_g,
-            avg_co2eq_per_time_at_sea,
-            additional_info,
-            avg_cargo_density_m_tonnes_m3
-        )
-        values (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            %s,%s
-        )
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (
+        amr_rows.append((
             imo, year,
             total_fuel,
             clean_numeric(row[f"{AMR}__fuel_consumptions_assigned_to_on_laden_[m_tonnes]"]),
@@ -620,61 +485,121 @@ def import_row(cur, row):
             clean_numeric(get_col(row, f"{AMR}__co2eq_emissions_per_time_spent_at_sea_[m_tonnes_co2eq_/_m_tonnes_·_n_miles]")),
             additional_info,
             avg_cargo_density,
-        ),
-    )
+        ))
 
-    if is_new_format:
-        return
+        if not is_new_format:
+            vr_rows.append((
+                imo, year,
+                clean_numeric(row[f"{VR}__distance_and_time__through_ice_[n_miles]"]),
+                clean_numeric(get_col(
+                    row,
+                    f"{VR}__total_time_spent_at_sea_[hours]",
+                    f"{VR}__time_spent_at_sea_[hours]",
+                )),
+                clean_numeric(row[f"{VR}__total_time_spent_at_sea_through_ice_[hours]"]),
+                clean_numeric(row[f"{VR}__average_energy_efficiency_on_laden_voyages__fuel_consumption_per_distance_on_laden_voyages_[kg_/_n_mile]"]),
+                clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(mass)_on_laden_voyages_[g_/_m_tonnes_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(volume)_on_laden_voyages_[g_/_m³_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(dwt)_on_laden_voyages_[g_/_dwt_carried_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(pax)_on_laden_voyages_[g_/_pax_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(freight)_on_laden_voyages_[g_/_m_tonnes_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_distance_on_laden_voyages_[kg_co2_/_n_mile]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(mass)_on_laden_voyages_[g_co2_/_m_tonnes_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(volume)_on_laden_voyages_[g_co2_/_m³_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(dwt)_on_laden_voyages_[g_co2_/_dwt_carried_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(pax)_on_laden_voyages_[g_co2_/_pax_·_n_miles]"]),
+                clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(freight)_on_laden_voyages_[g_co2_/_m_tonnes_·_n_miles]"]),
+                row[f"{VR}__additional_voluntary_reporting__additional_information_to_facilitate_the_understanding_of_the_reported_average_operational_energy_efficiency_indicators"] or None,
+                clean_numeric(row[f"{VR}__average_density_of_the_cargo_transported_[m_tonnes_/_m³]"]),
+            ))
 
-    cur.execute(
-        f"""
-        insert into voluntary_reporting (
+    return ship_rows, company_rows, doc_rows, verifier_rows, mm_rows, amr_rows, vr_rows
+
+
+def insert_batches(cur, ship_rows, company_rows, doc_rows, verifier_rows, mm_rows, amr_rows, vr_rows):
+    execute_values(cur,
+        "insert into ship (imo_number, reporting_period, name, ship_type, technical_efficiency, port_of_registry, home_port, ice_class) values %s on conflict (imo_number, reporting_period) do nothing",
+        ship_rows)
+
+    if company_rows:
+        execute_values(cur,
+            "insert into company (imo_number, reporting_period, company_imo_number, company_name) values %s on conflict (imo_number, reporting_period) do nothing",
+            company_rows)
+
+    execute_values(cur,
+        "insert into doc (imo_number, reporting_period, doc_issue_date, doc_expiry_date) values %s on conflict (imo_number, reporting_period) do nothing",
+        doc_rows)
+
+    execute_values(cur,
+        "insert into verifier (imo_number, reporting_period, verifier_number, verifier_name, verifier_nab, verifier_address, verifier_city, verifier_accreditation_number, verifier_country) values %s on conflict (imo_number, reporting_period) do nothing",
+        verifier_rows)
+
+    execute_values(cur,
+        "insert into monitoring_methods (imo_number, reporting_period, a, b, c, d, d_1) values %s on conflict (imo_number, reporting_period) do nothing",
+        mm_rows)
+
+    execute_values(cur,
+        """insert into annual_monitoring_results (
             imo_number, reporting_period,
-            through_ice_n_miles,
-            total_time_at_sea_hours,
-            total_time_at_sea_through_ice_hours,
-            fuel_per_distance_on_laden_kg_n_mile,
-            fuel_per_transport_mass_on_laden_g,
-            fuel_per_transport_volume_on_laden_g,
-            fuel_per_transport_dwt_on_laden_g,
-            fuel_per_transport_pax_on_laden_g,
-            fuel_per_transport_freight_on_laden_g,
-            co2_per_distance_on_laden_kg_n_mile,
-            co2_per_transport_mass_on_laden_g,
-            co2_per_transport_volume_on_laden_g,
-            co2_per_transport_dwt_on_laden_g,
-            co2_per_transport_pax_on_laden_g,
-            co2_per_transport_freight_on_laden_g,
-            additional_info,
-            avg_cargo_density_m_tonnes_m3
-        )
-        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (imo_number, reporting_period) do nothing
-        """,
-        (imo, year,
-         clean_numeric(row[f"{VR}__distance_and_time__through_ice_[n_miles]"]),
-         clean_numeric(get_col(
-             row,
-             f"{VR}__total_time_spent_at_sea_[hours]",
-             f"{VR}__time_spent_at_sea_[hours]",
-         )),
-         clean_numeric(row[f"{VR}__total_time_spent_at_sea_through_ice_[hours]"]),
-         clean_numeric(row[f"{VR}__average_energy_efficiency_on_laden_voyages__fuel_consumption_per_distance_on_laden_voyages_[kg_/_n_mile]"]),
-         clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(mass)_on_laden_voyages_[g_/_m_tonnes_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(volume)_on_laden_voyages_[g_/_m³_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(dwt)_on_laden_voyages_[g_/_dwt_carried_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(pax)_on_laden_voyages_[g_/_pax_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__fuel_consumption_per_transport_work_(freight)_on_laden_voyages_[g_/_m_tonnes_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_distance_on_laden_voyages_[kg_co2_/_n_mile]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(mass)_on_laden_voyages_[g_co2_/_m_tonnes_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(volume)_on_laden_voyages_[g_co2_/_m³_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(dwt)_on_laden_voyages_[g_co2_/_dwt_carried_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(pax)_on_laden_voyages_[g_co2_/_pax_·_n_miles]"]),
-         clean_numeric(row[f"{VR}__co2_emissions_per_transport_work_(freight)_on_laden_voyages_[g_co2_/_m_tonnes_·_n_miles]"]),
-         row[f"{VR}__additional_voluntary_reporting__additional_information_to_facilitate_the_understanding_of_the_reported_average_operational_energy_efficiency_indicators"] or None,
-         clean_numeric(row[f"{VR}__average_density_of_the_cargo_transported_[m_tonnes_/_m³]"]),
-         ),
-    )
+            total_fuel_consumption_m_tonnes, fuel_consumption_on_laden_m_tonnes,
+            fuel_consumption_derogation_m_tonnes, fuel_consumption_cargo_heating_m_tonnes,
+            fuel_consumption_dynamic_positioning_m_tonnes,
+            total_co2_emissions_m_tonnes, annual_total_time_spent_at_sea_hours,
+            co2_between_ms_ports_m_tonnes, co2_from_ms_ports_m_tonnes, co2_to_ms_ports_m_tonnes,
+            co2_at_berth_m_tonnes, co2_at_ms_ports_m_tonnes,
+            co2_passenger_m_tonnes, co2_freight_m_tonnes, co2_on_laden_m_tonnes, co2_ets_m_tonnes,
+            total_ch4_emissions_m_tonnes, ch4_between_ms_ports_m_tonnes, ch4_from_ms_ports_m_tonnes,
+            ch4_to_ms_ports_m_tonnes, ch4_at_berth_m_tonnes, ch4_at_ms_ports_m_tonnes,
+            ch4_on_laden_m_tonnes, ch4_passenger_m_tonnes, ch4_freight_m_tonnes, ch4_ets_m_tonnes,
+            total_n2o_emissions_m_tonnes, n2o_between_ms_ports_m_tonnes, n2o_from_ms_ports_m_tonnes,
+            n2o_to_ms_ports_m_tonnes, n2o_at_berth_m_tonnes, n2o_at_ms_ports_m_tonnes,
+            n2o_on_laden_m_tonnes, n2o_passenger_m_tonnes, n2o_freight_m_tonnes, n2o_ets_m_tonnes,
+            total_co2eq_emissions_m_tonnes, co2eq_between_ms_ports_m_tonnes, co2eq_from_ms_ports_m_tonnes,
+            co2eq_to_ms_ports_m_tonnes, co2eq_at_berth_m_tonnes, co2eq_at_ms_ports_m_tonnes,
+            co2eq_on_laden_m_tonnes, co2eq_passenger_m_tonnes, co2eq_freight_m_tonnes,
+            co2eq_ets_m_tonnes, co2eq_derogation_m_tonnes,
+            distance_through_ice_n_miles, time_spent_at_sea_through_ice_hours,
+            avg_fuel_per_distance_kg_n_mile, avg_fuel_per_distance_on_laden_kg_n_mile,
+            avg_fuel_per_transport_mass_g, avg_fuel_per_transport_mass_on_laden_g,
+            avg_fuel_per_transport_volume_g, avg_fuel_per_transport_volume_on_laden_g,
+            avg_fuel_per_transport_dwt_g, avg_fuel_per_transport_dwt_on_laden_g,
+            avg_fuel_per_transport_pax_g, avg_fuel_per_transport_pax_on_laden_g,
+            avg_fuel_per_transport_freight_g, avg_fuel_per_transport_freight_on_laden_g,
+            avg_fuel_per_time_at_sea_m_tonnes_hour,
+            avg_co2_per_distance_kg_n_mile, avg_co2_per_distance_on_laden_kg_n_mile,
+            avg_co2_per_transport_mass_g, avg_co2_per_transport_mass_on_laden_g,
+            avg_co2_per_transport_volume_g, avg_co2_per_transport_volume_on_laden_g,
+            avg_co2_per_transport_dwt_g, avg_co2_per_transport_dwt_on_laden_g,
+            avg_co2_per_transport_pax_g, avg_co2_per_transport_pax_on_laden_g,
+            avg_co2_per_transport_freight_g, avg_co2_per_transport_freight_on_laden_g,
+            avg_co2_per_time_at_sea_m_tonnes_hour,
+            avg_co2eq_per_distance_kg_n_mile, avg_co2eq_per_distance_on_laden_kg_n_mile,
+            avg_co2eq_per_transport_mass_g, avg_co2eq_per_transport_mass_on_laden_g,
+            avg_co2eq_per_transport_volume_g, avg_co2eq_per_transport_volume_on_laden_g,
+            avg_co2eq_per_transport_dwt_g, avg_co2eq_per_transport_dwt_on_laden_g,
+            avg_co2eq_per_transport_pax_g, avg_co2eq_per_transport_pax_on_laden_g,
+            avg_co2eq_per_transport_freight_g, avg_co2eq_per_transport_freight_on_laden_g,
+            avg_co2eq_per_time_at_sea,
+            additional_info, avg_cargo_density_m_tonnes_m3
+        ) values %s on conflict (imo_number, reporting_period) do nothing""",
+        amr_rows)
+
+    if vr_rows:
+        execute_values(cur,
+            """insert into voluntary_reporting (
+                imo_number, reporting_period,
+                through_ice_n_miles, total_time_at_sea_hours, total_time_at_sea_through_ice_hours,
+                fuel_per_distance_on_laden_kg_n_mile,
+                fuel_per_transport_mass_on_laden_g, fuel_per_transport_volume_on_laden_g,
+                fuel_per_transport_dwt_on_laden_g, fuel_per_transport_pax_on_laden_g,
+                fuel_per_transport_freight_on_laden_g,
+                co2_per_distance_on_laden_kg_n_mile,
+                co2_per_transport_mass_on_laden_g, co2_per_transport_volume_on_laden_g,
+                co2_per_transport_dwt_on_laden_g, co2_per_transport_pax_on_laden_g,
+                co2_per_transport_freight_on_laden_g,
+                additional_info, avg_cargo_density_m_tonnes_m3
+            ) values %s on conflict (imo_number, reporting_period) do nothing""",
+            vr_rows)
 
 
 def fetch_available_files():
@@ -713,10 +638,10 @@ def main():
         check_unknown_columns(df.columns.tolist(), year)
         delete_year(cur, year)
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            import_row(cur, row)
-            if (i + 1) % 500 == 0:
-                print(f"  {i + 1} rows...")
+        print(f"  Building {len(df)} rows...")
+        batches = build_batches(df)
+        print(f"  Inserting...")
+        insert_batches(cur, *batches)
 
         save_hash(cur, year, file_hash)
         conn.commit()
