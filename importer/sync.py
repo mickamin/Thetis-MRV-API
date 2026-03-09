@@ -277,9 +277,11 @@ def build_batches(df):
         ))
 
         if is_new_format:
+            raw_company_imo = get_col(row, "company__imo_number")
+            company_imo = int(str(raw_company_imo).strip()) if raw_company_imo is not None else None
             company_rows.append((
                 imo, year,
-                get_col(row, "company__imo_number"),
+                company_imo,
                 get_col(row, "company__name"),
             ))
 
